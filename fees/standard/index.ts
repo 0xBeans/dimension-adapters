@@ -28,15 +28,11 @@
 //   fee splitter, the fee multisig, the treasury's pool positions and the charter
 //   ledger. Buybacks executed later from those balances are recognised as holders
 //   revenue on their own schedule.
-//
-// STANDARD is not on a price feed DefiLlama knows, so STANDARD amounts are converted to
-// ETH at the canonical STANDARD/ETH pool's spot price read from PoolManager storage.
 // -----------------------------------------------------------------------------
 import { FetchOptions, SimpleAdapter } from "../../adapters/types";
 import { CHAIN } from "../../helpers/chains";
 import { METRIC } from "../../helpers/metrics";
 import ADDRESSES from "../../helpers/coreAssets.json";
-import { ChainApi } from "@defillama/sdk";
 
 const POOL_MANAGER = "0x8366a39CC670B4001A1121B8F6A443A643e40951";
 const TAX_HOOK = "0xF1eE073811B14359D850825E48d200483200eDcd";
@@ -55,10 +51,8 @@ const LICENSE_AUCTIONS = [
   "0x44731EFf9da8fDD30003AA7C0B324368B3DfFE5e", // periphery v2, retired
   "0xA45CE49303EEd5846F841BFd4bAC6aE8C805EC05", // genesis, retired
 ];
-const LAUNCH_FACTORIES: { address: string; launchedTopic: string }[] = [
-  { address: "0x3D6Ea4e97B8AB9E1A1B4943fEBfFe22D8c920091", launchedTopic: "0xa0354dae199953f2dbde6be8415166a744e7f92b7328671692196d8fdbb6bd9d" }, // v1
-  { address: "0x3D69104Da2518f4833D71444D6611310F2D685f2", launchedTopic: "0x93e9aed10a0259070dbc9cbe242cfd7dfde85172011e531fff069983bfeb470f" }, // v2
-];
+const LAUNCH_FACTORY_V1 = "0x3D6Ea4e97B8AB9E1A1B4943fEBfFe22D8c920091";
+const LAUNCH_FACTORY_V2 = "0x3D69104Da2518f4833D71444D6611310F2D685f2";
 const FEE_ESCROWS = [
   "0xcbC8f65EF158c829379472DEe771cF3E7741440E", // v1
   "0x479B2997a7283f7d3baacc984558fe4e1D7467af", // v2
@@ -88,11 +82,6 @@ const POOLS: { id: string; currency0: string; currency1: string; label: string; 
   { id: "0x387bf619da4d3fb62bb276482693dba1b9b3520f573cabdfe033384a24125982", currency0: ADDRESSES.null, currency1: USDG, label: "ETH/USDG LP Fees", treasuryShare: 0.53 },
 ];
 
-// Where the PolBuyback flow is recognised as holders revenue: at the buyback
-// ("source") or when the bought STANDARD is paid out as S-Bills premiums
-// ("payout"). One stage of the same flow, never both.
-const SBILLS_BASIS: "source" | "payout" = "source";
-
 const EVENTS = {
   taxCollected: "event TaxCollected(bool isBuy, uint256 amount)",
   lpTaxCollected: "event LpTaxCollected(address indexed sender, uint256 ethAmount, uint256 tokenAmount)",
@@ -102,15 +91,15 @@ const EVENTS = {
   revoked: "event Revoked(uint256 indexed charterId, address indexed owner, address indexed informant, uint256 gross, uint256 bounty, uint256 ownerNet)",
   transfer: "event Transfer(address indexed from, address indexed to, uint256 value)",
   credited: "event Credited(address indexed curve, address indexed stock, uint256 amount)",
+  // Launched carries the launch config struct, whose layout changed between factory
+  // versions, so each factory has its own signature (ABIs from Sourcify).
+  launchedV1: "event Launched(address indexed token, address indexed curve, address indexed creator, (address token, address curve, address stock, address creator, address referrer, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) futurePoolKey, bytes32 futurePoolId, bool transfersLockedUntilGraduation, string name, string symbol, string metadataURI, uint64 launchTime, uint128 phantomReserve, uint256 virtualTokens, uint256 endVirtualTokens, uint256 curveSupply, uint256 poolSupply, uint16 baseFeeBps, uint16 creatorShareOfBaseBps, uint16 creatorTaxBps, bool snipeTaxOn, uint16[] snipeScheduleBps, uint256 creatorBuyCap, uint16 charterDropBps, uint256 charterDropAmount, address charterDrop) info)",
+  launchedV2: "event Launched(address indexed token, address indexed curve, address indexed creator, (address token, address curve, address stock, address creator, address referrer, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) futurePoolKey, bytes32 futurePoolId, string name, string symbol, string metadataURI, uint64 launchTime, uint128 phantomReserve, uint256 virtualTokens, uint256 endVirtualTokens, uint256 curveSupply, uint256 poolSupply, uint16 baseFeeBps, uint16 creatorShareOfBaseBps, bool snipeTaxOn, uint16[] snipeScheduleBps, uint256 creatorBuyCap, uint16 charterDropBps, uint256 charterDropAmount, address charterDrop, uint8 dropMode, address module, bool enforced) info)",
   swap: "event Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)",
   polBuyback: "event BuybackExecuted(uint256 ethSpent, uint256 tokensBought, address indexed vault)",
   contractionBuyback: "event BuybackExecuted(uint256 ethSpent, uint256 tokensBurned)",
   sbillsExited: "event Exited(uint256 indexed id, address indexed owner, uint256 principal, uint256 fee, uint256 vestedForfeited, uint256 bonusForfeited)",
-  sbillsRedeemed: "event Redeemed(uint256 indexed id, address indexed owner, uint256 principal, uint256 premium, uint256 bonus)",
-  sbillsRolled: "event Rolled(uint256 indexed id, uint256 ratePaid, uint256 premium, uint64 maturity, uint256 bonusCollected, uint256 newPrincipal)",
 };
-const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-const SWAP_TOPIC = "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f";
 
 const LABELS = {
   swapTax: "STANDARD/ETH Swap Tax",
@@ -125,39 +114,15 @@ const LABELS = {
   exitFees: "Charter Exit Fees",
   informantBounty: "Revocation Bounties",
   sbillsExit: "S-Bills Exit Fees",
-  sbillsPremium: "S-Bills Premiums",
   stdBurn: "STANDARD Retired From Fees",
 };
 
 const pad32 = (address: string) => "0x" + address.toLowerCase().replace("0x", "").padStart(64, "0");
 
-// ETH per STANDARD. Taken from the last STANDARD/ETH swap in the window; when
-// the window has no swap, from the pool's slot0 at the latest block, since the
-// public RPCs do not serve historical state. PoolManager keeps pools in a mapping
-// at storage slot 6 and slot0 is its first word with sqrtPriceX96 in the low 160
-// bits. currency0 is ETH and currency1 is STANDARD, so price1/0 = (sqrtP / 2^96)^2.
-async function stdToEthRatio(options: FetchOptions, stdPoolSwaps: { sqrtPriceX96: string }[]): Promise<(stdWei: bigint) => bigint> {
-  let sqrtP = stdPoolSwaps.length ? BigInt(stdPoolSwaps[stdPoolSwaps.length - 1].sqrtPriceX96) : 0n;
-  if (sqrtP === 0n) {
-    const { ethers } = await import("ethers");
-    const slot = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(["bytes32", "uint256"], [STD_ETH_POOL_ID, 6]));
-    const latest = new ChainApi({ chain: options.chain });
-    const word: string = await latest.call({ target: POOL_MANAGER, abi: "function extsload(bytes32 slot) view returns (bytes32)", params: [slot] });
-    sqrtP = BigInt(word) & ((1n << 160n) - 1n);
-  }
-  if (sqrtP === 0n) throw new Error("STANDARD/ETH pool price unavailable");
-  const q192 = 1n << 192n;
-  return (stdWei: bigint) => (stdWei * q192) / (sqrtP * sqrtP);
-}
-
 const fetch = async (options: FetchOptions) => {
   const dailyFees = options.createBalances();
   const dailySupplySideRevenue = options.createBalances();
   const dailyHoldersRevenue = options.createBalances();
-  const swapsByPool: Record<string, { amount0: string; amount1: string; fee: string; sqrtPriceX96: string }[]> = {};
-  for (const pool of POOLS) swapsByPool[pool.id] = await options.getLogs({ target: POOL_MANAGER, eventAbi: EVENTS.swap, topics: [SWAP_TOPIC, pool.id] });
-  const toEth = await stdToEthRatio(options, swapsByPool[STD_ETH_POOL_ID]);
-  const addStd = (bal: ReturnType<typeof options.createBalances>, stdWei: bigint, label: string) => bal.addGasToken(toEth(stdWei), label);
 
   // 1. STANDARD/ETH hook taxes, ETH to the FeeSplitter.
   const taxLogs = await options.getLogs({ target: TAX_HOOK, eventAbi: EVENTS.taxCollected });
@@ -165,8 +130,8 @@ const fetch = async (options: FetchOptions) => {
   const lpTaxLogs = await options.getLogs({ target: TAX_HOOK, eventAbi: EVENTS.lpTaxCollected });
   for (const log of lpTaxLogs) {
     dailyFees.addGasToken(log.ethAmount, LABELS.lpExitTax);
-    addStd(dailyFees, BigInt(log.tokenAmount), LABELS.lpExitTax);
-    addStd(dailyHoldersRevenue, BigInt(log.tokenAmount), LABELS.stdBurn);
+    dailyFees.add(STANDARD, log.tokenAmount, LABELS.lpExitTax);
+    dailyHoldersRevenue.add(STANDARD, log.tokenAmount, LABELS.stdBurn);
   }
 
   // 2. Charter auctions, ETH to the FeeSplitter.
@@ -175,10 +140,9 @@ const fetch = async (options: FetchOptions) => {
 
   // 3. Launchpad. Protocol share lands at the fee multisig as a token transfer;
   //    creator share is credited in FeeEscrow; launch fee is fixed per launch.
-  const toMultisig = await options.getLogs({
-    targets: LAUNCH_PAIR_ASSETS, eventAbi: EVENTS.transfer, flatten: false,
-    topics: [TRANSFER_TOPIC, null, pad32(FEE_MULTISIG)],
-  });
+  // extraTopics follow the eventAbi's topic0: [from, to].
+  const toFeeMultisig = { extraTopics: [null, pad32(FEE_MULTISIG)] };
+  const toMultisig = await options.getLogs({ targets: LAUNCH_PAIR_ASSETS, eventAbi: EVENTS.transfer, flatten: false, ...toFeeMultisig });
   toMultisig.forEach((logs: { value: string }[], i: number) => {
     for (const log of logs) dailyFees.add(LAUNCH_PAIR_ASSETS[i], log.value, LABELS.launchpadProtocol);
   });
@@ -187,15 +151,18 @@ const fetch = async (options: FetchOptions) => {
     dailyFees.add(log.stock, log.amount, LABELS.launchpadCreator);
     dailySupplySideRevenue.add(log.stock, log.amount, LABELS.launchpadCreator);
   }
-  for (const factory of LAUNCH_FACTORIES) {
-    const launched = await options.getLogs({ target: factory.address, topic: factory.launchedTopic, onlyArgs: false, entireLog: true });
-    dailyFees.addGasToken(BigInt(launched.length) * LAUNCH_FEE_WEI, LABELS.launchFee);
-  }
+  const launchedV1 = await options.getLogs({ target: LAUNCH_FACTORY_V1, eventAbi: EVENTS.launchedV1 });
+  const launchedV2 = await options.getLogs({ target: LAUNCH_FACTORY_V2, eventAbi: EVENTS.launchedV2 });
+  dailyFees.addGasToken(BigInt(launchedV1.length + launchedV2.length) * LAUNCH_FEE_WEI, LABELS.launchFee);
 
   // 4. LP fees on protocol-owned v4 pools. Fee is charged on the input side;
-  //    the swapper's negative delta is what went in.
+  //    the swapper's negative delta is what went in. Every v4 pool lives in the
+  //    PoolManager, so each pool is one indexed lookup on its id (topic1); the
+  //    indexer ignores a list of ids in one topic.
   for (const pool of POOLS) {
-    for (const log of swapsByPool[pool.id]) {
+    const poolFilter = { extraTopics: [pool.id] };
+    const swaps = await options.getLogs({ target: POOL_MANAGER, eventAbi: EVENTS.swap, ...poolFilter });
+    for (const log of swaps) {
       const a0 = BigInt(log.amount0);
       const a1 = BigInt(log.amount1);
       const fee = BigInt(log.fee);
@@ -206,10 +173,10 @@ const fetch = async (options: FetchOptions) => {
       const treasury = (feeAmount * BigInt(Math.round(pool.treasuryShare * 1e6))) / 1_000_000n;
       const others = feeAmount - treasury;
       const add = (bal: ReturnType<typeof options.createBalances>, amt: bigint, label: string) =>
-        token === STANDARD ? addStd(bal, amt, label) : token === ADDRESSES.null ? bal.addGasToken(amt, label) : bal.add(token, amt, label);
+        token === ADDRESSES.null ? bal.addGasToken(amt, label) : bal.add(token, amt, label);
       add(dailyFees, treasury, LABELS.lpTreasury);
       // The protocol-owned position burns the STANDARD side of its STANDARD/ETH fees.
-      if (pool.id === STD_ETH_POOL_ID && token === STANDARD) addStd(dailyHoldersRevenue, treasury, LABELS.stdBurn);
+      if (pool.id === STD_ETH_POOL_ID && token === STANDARD) dailyHoldersRevenue.add(STANDARD, treasury, LABELS.stdBurn);
       if (others > 0n) {
         add(dailyFees, others, LABELS.lpThirdParty);
         add(dailySupplySideRevenue, others, LABELS.lpThirdParty);
@@ -223,28 +190,28 @@ const fetch = async (options: FetchOptions) => {
   const licenseLogs = await options.getLogs({ targets: LICENSE_AUCTIONS, eventAbi: EVENTS.licensesPurchased });
   for (const log of licenseLogs) {
     const paid = BigInt(log.count) * BigInt(log.unitPrice);
-    addStd(dailyFees, paid, LABELS.licenseAuctions);
-    addStd(dailyHoldersRevenue, paid, LABELS.licenseAuctions);
+    dailyFees.add(STANDARD, paid, LABELS.licenseAuctions);
+    dailyHoldersRevenue.add(STANDARD, paid, LABELS.licenseAuctions);
   }
   const withdrawnLogs = await options.getLogs({ target: CENTRAL_BANK, eventAbi: EVENTS.withdrawn });
   for (const log of withdrawnLogs) {
     const fee = BigInt(log.gross) - BigInt(log.net);
-    addStd(dailyFees, fee, LABELS.exitFees);
-    addStd(dailyHoldersRevenue, fee, LABELS.exitFees);
+    dailyFees.add(STANDARD, fee, LABELS.exitFees);
+    dailyHoldersRevenue.add(STANDARD, fee, LABELS.exitFees);
   }
   const revokedLogs = await options.getLogs({ target: CENTRAL_BANK, eventAbi: EVENTS.revoked });
   for (const log of revokedLogs) {
     const fee = BigInt(log.gross) - BigInt(log.ownerNet);
     const bounty = BigInt(log.bounty);
-    addStd(dailyFees, fee, LABELS.exitFees);
-    addStd(dailySupplySideRevenue, bounty, LABELS.informantBounty);
-    addStd(dailyHoldersRevenue, fee - bounty, LABELS.exitFees);
+    dailyFees.add(STANDARD, fee, LABELS.exitFees);
+    dailySupplySideRevenue.add(STANDARD, bounty, LABELS.informantBounty);
+    dailyHoldersRevenue.add(STANDARD, fee - bounty, LABELS.exitFees);
   }
 
   // 6. Buybacks of STANDARD on the canonical pool, funded by fee ETH routed
   //    through the fee splitter. Recognised when they execute.
   const polLogs = await options.getLogs({ target: POL_BUYBACK, eventAbi: EVENTS.polBuyback });
-  if (SBILLS_BASIS === "source") for (const log of polLogs) dailyHoldersRevenue.addGasToken(log.ethSpent, METRIC.TOKEN_BUY_BACK);
+  for (const log of polLogs) dailyHoldersRevenue.addGasToken(log.ethSpent, METRIC.TOKEN_BUY_BACK);
   const contractionLogs = await options.getLogs({ target: CONTRACTION_VAULT, eventAbi: EVENTS.contractionBuyback });
   for (const log of contractionLogs) dailyHoldersRevenue.addGasToken(log.ethSpent, METRIC.TOKEN_BUY_BACK);
 
@@ -252,16 +219,8 @@ const fetch = async (options: FetchOptions) => {
   //    bills still locked. Premiums distribute STANDARD bought by PolBuyback.
   const exitedLogs = await options.getLogs({ target: SBILLS, eventAbi: EVENTS.sbillsExited });
   for (const log of exitedLogs) {
-    addStd(dailyFees, BigInt(log.fee), LABELS.sbillsExit);
-    addStd(dailyHoldersRevenue, BigInt(log.fee), LABELS.sbillsExit);
-  }
-  if (SBILLS_BASIS === "payout") {
-    const redeemed = await options.getLogs({ target: SBILLS, eventAbi: EVENTS.sbillsRedeemed });
-    for (const log of redeemed) addStd(dailyHoldersRevenue, BigInt(log.premium), LABELS.sbillsPremium);
-    // A roll folds the matured premium into principal and escrows the renewed
-    // term's premium, which the event carries.
-    const rolled = await options.getLogs({ target: SBILLS, eventAbi: EVENTS.sbillsRolled });
-    for (const log of rolled) addStd(dailyHoldersRevenue, BigInt(log.premium), LABELS.sbillsPremium);
+    dailyFees.add(STANDARD, log.fee, LABELS.sbillsExit);
+    dailyHoldersRevenue.add(STANDARD, log.fee, LABELS.sbillsExit);
   }
 
   const dailyRevenue = dailyFees.clone();
@@ -283,7 +242,7 @@ const adapter: SimpleAdapter = {
   start: "2026-09-15",
   fetch,
   methodology: {
-    Fees: "Everything paid into STANDARD: the ETH tax on every STANDARD/ETH swap and LP exit, charter auction prices in ETH, launchpad trade fees in the launch's pair asset plus the fixed launch fee, LP fees on the protocol's Uniswap v4 pools, license auction payments and charter exit fees paid in STANDARD, and S-Bills early-exit fees. STANDARD amounts are valued at the canonical STANDARD/ETH pool spot price.",
+    Fees: "Everything paid into STANDARD: the ETH tax on every STANDARD/ETH swap and LP exit, charter auction prices in ETH, launchpad trade fees in the launch's pair asset plus the fixed launch fee, LP fees on the protocol's Uniswap v4 pools, license auction payments and charter exit fees paid in STANDARD, and S-Bills early-exit fees.",
     UserFees: "Swap taxes, auction prices, launchpad trade fees, pool swap fees and exit fees are all paid by users.",
     SupplySideRevenue: "The creator share of launchpad trade fees, the third-party LP share of fees on the protocol's pools, and informant bounties on charter revocations.",
     Revenue: "Fees minus the supply side: the part of fees kept by the protocol and its token holders.",
@@ -341,7 +300,6 @@ const adapter: SimpleAdapter = {
       [LABELS.licenseAuctions]: "STANDARD paid for licenses and retired from supply.",
       [LABELS.exitFees]: "Charter exit fees in STANDARD, half recycled to remaining charters and half retired.",
       [LABELS.sbillsExit]: "S-Bills exit fees in STANDARD, half burned and half paid to remaining bills.",
-      [LABELS.sbillsPremium]: "S-Bills premiums paid to bill holders in STANDARD, when the PolBuyback flow is recognised at payout rather than at the buyback.",
     },
   },
 };
